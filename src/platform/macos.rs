@@ -496,6 +496,9 @@ pub trait ActiveEventLoopExtMacOS {
     /// `-[NSApplication terminate:]`: inside an event handler they hit winit's re-entrancy check.
     /// The closure also runs while AppKit tracks a menu or a live resize and while it waits for
     /// `-[NSApplication replyToApplicationShouldTerminate:]`. Closures run in the order queued.
+    ///
+    /// A panic in `closure` aborts the process, because it would unwind out of a
+    /// `CFRunLoopPerformBlock` block: `run_app` neither delivers `LoopExiting` nor returns.
     fn run_after_handler<F: FnOnce() + 'static>(&self, closure: F);
     /// Intercept native Quit (`-[NSApplication terminate:]`) so that the application can clean
     /// up before it exits.
