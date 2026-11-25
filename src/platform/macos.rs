@@ -500,9 +500,12 @@ pub trait ActiveEventLoopExtMacOS {
     /// Intercept native Quit (`-[NSApplication terminate:]`) so that the application can clean
     /// up before it exits.
     ///
-    /// The first Quit request sends `map(reason)` through `proxy` and is cancelled, as are the
-    /// requests that arrive before [`finish_quit`](Self::finish_quit). Without this hook, AppKit
-    /// exits as soon as Quit is chosen.
+    /// The first Quit request sends `map(reason)` through `proxy`. An ordinary request is
+    /// cancelled, as are the requests that arrive before [`finish_quit`](Self::finish_quit). A
+    /// [`QuitReason::System`] request is answered `NSTerminateLater` instead, so log out, restart
+    /// and shut down are never refused; AppKit then runs its modal-panel run loop until
+    /// `finish_quit`. A system request while an ordinary one drains sends `map` again with
+    /// [`QuitReason::System`]. Without this hook, AppKit exits as soon as Quit is chosen.
     ///
     /// # Panics
     ///
@@ -514,8 +517,9 @@ pub trait ActiveEventLoopExtMacOS {
     );
     /// Let the intercepted Quit proceed once cleanup is done.
     ///
-    /// After the outermost event handler returns, winit re-issues `terminate:` and grants it.
-    /// The application exits through `applicationWillTerminate:`, so `run_app` does not return.
+    /// After the outermost event handler returns, winit re-issues an ordinary `terminate:` and
+    /// grants it, or calls `replyToApplicationShouldTerminate:` for a system request. The
+    /// application exits through `applicationWillTerminate:`, so `run_app` does not return.
     ///
     /// # Panics
     ///
@@ -562,8 +566,10 @@ impl ActiveEventLoopExtMacOS for ActiveEventLoop {
 /// Why AppKit asked the application to quit; see [`ActiveEventLoopExtMacOS::intercept_quit`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum QuitReason {
-    /// The Quit menu item, Cmd+Q, the Dock, or a quit Apple event from another application.
+    /// The Quit menu item, Cmd+Q, the Dock, or a quit Apple event without a system reason.
     Ordinary,
+    /// A quit Apple event whose `keyAEQuitReason` is log out, restart or shut down.
+    System,
 }
 
 /// Option as alt behavior.

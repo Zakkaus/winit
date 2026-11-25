@@ -5,12 +5,15 @@ use std::time::Instant;
 use std::{fmt, mem};
 
 use objc2::rc::Retained;
-use objc2::{declare_class, msg_send_id, mutability, ClassType, DeclaredClass};
+use objc2::{declare_class, msg_send, msg_send_id, mutability, ClassType, DeclaredClass};
 use objc2_app_kit::{
     NSApplication, NSApplicationActivationPolicy, NSApplicationDelegate,
     NSApplicationTerminateReply, NSRunningApplication,
 };
-use objc2_foundation::{MainThreadMarker, NSNotification, NSObject, NSObjectProtocol};
+use objc2_foundation::{
+    MainThreadMarker, NSAppleEventDescriptor, NSAppleEventManager, NSNotification, NSObject,
+    NSObjectProtocol,
+};
 
 use super::event_handler::EventHandler;
 use super::event_loop::{notify_windows_of_exit, stop_app_immediately, ActiveEventLoop, PanicInfo};
@@ -202,31 +205,44 @@ impl ApplicationDelegate {
                 // request's `applicationWillTerminate:` can run winit's handler.
                 unsafe { app.terminate(None) };
             },
+            QuitState::Finishing(QuitReason::System) => {
+                quit.state.set(QuitState::Authorized);
+                tracing::debug!(target: "winit::quit", "reply");
+                // SAFETY: On the main thread and outside any event handler, so the
+                // `applicationWillTerminate:` that may follow can run winit's handler.
+                unsafe { app.replyToApplicationShouldTerminate(true) };
+            },
             state => unreachable!("Quit completed in state {state:?}"),
         }
     }
 
-    /// Forward the first request to the application and cancel it; cancel repeats while the
-    /// application drains, and grant only the request that `complete_quit` re-issues.
+    /// Forward the first request to the application. An ordinary request is cancelled, and
+    /// `complete_quit` re-issues it; a system request is never refused: AppKit waits for
+    /// `complete_quit`'s reply instead. Repeats are cancelled while the application drains,
+    /// except that a system request upgrades a pending ordinary one.
     fn should_terminate(&self) -> NSApplicationTerminateReply {
+        use NSApplicationTerminateReply as Reply;
+
         let quit = &self.ivars().quit;
-        let reason = QuitReason::Ordinary;
-        let (state, phase, reply) = match quit.state.get() {
-            QuitState::Disabled => return NSApplicationTerminateReply::NSTerminateNow,
-            QuitState::Armed => {
-                (quit.request.borrow().as_ref().expect("armed Quit hook"))(reason);
-                (
-                    QuitState::Draining(reason),
-                    "intercept",
-                    NSApplicationTerminateReply::NSTerminateCancel,
-                )
+        let reason = quit_reason();
+        let request = || (quit.request.borrow().as_ref().expect("armed Quit hook"))(reason);
+        let (state, phase, reply) = match (quit.state.get(), reason) {
+            (QuitState::Disabled, _) => return Reply::NSTerminateNow,
+            (QuitState::Armed, QuitReason::Ordinary) => {
+                request();
+                (QuitState::Draining(reason), "intercept", Reply::NSTerminateCancel)
             },
-            state @ (QuitState::Draining(_) | QuitState::Finishing(_)) => {
-                (state, "veto", NSApplicationTerminateReply::NSTerminateCancel)
+            (QuitState::Armed | QuitState::Draining(QuitReason::Ordinary), QuitReason::System) => {
+                request();
+                (QuitState::Draining(reason), "later", Reply::NSTerminateLater)
             },
-            QuitState::Authorized => {
-                (QuitState::Authorized, "grant", NSApplicationTerminateReply::NSTerminateNow)
+            (QuitState::Finishing(QuitReason::Ordinary), QuitReason::System) => {
+                (QuitState::Finishing(reason), "later", Reply::NSTerminateLater)
             },
+            (state @ (QuitState::Draining(_) | QuitState::Finishing(_)), _) => {
+                (state, "veto", Reply::NSTerminateCancel)
+            },
+            (QuitState::Authorized, _) => (QuitState::Authorized, "grant", Reply::NSTerminateNow),
         };
         tracing::debug!(target: "winit::quit", "{phase}");
         quit.state.set(state);
@@ -533,6 +549,47 @@ impl fmt::Debug for AfterHandler {
             .field("closures", &self.closures.borrow().len())
             .field("queued", &self.queued)
             .finish()
+    }
+}
+
+/// Read `keyAEQuitReason` (`'why?'`) from the quit Apple event being handled, if any.
+fn quit_reason() -> QuitReason {
+    const fn code(bytes: &[u8; 4]) -> u32 {
+        u32::from_be_bytes(*bytes)
+    }
+    const SYSTEM: [u32; 6] = [
+        code(b"logo"), // kAELogOut
+        code(b"rlgo"), // kAEReallyLogOut
+        code(b"rrst"), // kAEShowRestartDialog
+        code(b"rest"), // kAERestart
+        code(b"rsdn"), // kAEShowShutdownDialog
+        code(b"shut"), // kAEShutDown
+    ];
+
+    // SAFETY: Called on the main thread; the selectors exist on `NSAppleEventManager` and
+    // `NSAppleEventDescriptor` with these argument and return types.
+    unsafe {
+        let Some(event) = NSAppleEventManager::sharedAppleEventManager().currentAppleEvent() else {
+            return QuitReason::Ordinary;
+        };
+        let class: u32 = msg_send![&event, eventClass];
+        let id: u32 = msg_send![&event, eventID];
+        if class != code(b"aevt") || id != code(b"quit") {
+            return QuitReason::Ordinary;
+        }
+        // loginwindow sends the reason as an attribute; accept a parameter too.
+        let why: Option<Retained<NSAppleEventDescriptor>> =
+            msg_send_id![&event, attributeDescriptorForKeyword: code(b"why?")];
+        let why = why.or_else(|| msg_send_id![&event, paramDescriptorForKeyword: code(b"why?")]);
+        let why = why.map(|why| match why.typeCodeValue() {
+            0 => why.enumCodeValue(),
+            why => why,
+        });
+        if why.is_some_and(|why| SYSTEM.contains(&why)) {
+            QuitReason::System
+        } else {
+            QuitReason::Ordinary
+        }
     }
 }
 

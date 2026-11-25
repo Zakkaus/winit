@@ -129,6 +129,8 @@ version = "0.2.2"
 features = [
     "block2",
     "dispatch",
+    "NSAppleEventDescriptor",
+    "NSAppleEventManager",
     "NSArray",
     "NSAttributedString",
     "NSData",
