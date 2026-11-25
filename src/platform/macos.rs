@@ -490,6 +490,13 @@ pub trait ActiveEventLoopExtMacOS {
     fn set_allows_automatic_window_tabbing(&self, enabled: bool);
     /// Returns whether the system can automatically organize windows into tabs.
     fn allows_automatic_window_tabbing(&self) -> bool;
+    /// Run `closure` on the main thread after the outermost event handler returns.
+    ///
+    /// Use this for AppKit calls that run a nested run loop or re-enter winit, such as
+    /// `-[NSApplication terminate:]`: inside an event handler they hit winit's re-entrancy check.
+    /// The closure also runs while AppKit tracks a menu or a live resize and while it waits for
+    /// `-[NSApplication replyToApplicationShouldTerminate:]`. Closures run in the order queued.
+    fn run_after_handler<F: FnOnce() + 'static>(&self, closure: F);
 }
 
 impl ActiveEventLoopExtMacOS for ActiveEventLoop {
@@ -507,6 +514,10 @@ impl ActiveEventLoopExtMacOS for ActiveEventLoop {
 
     fn allows_automatic_window_tabbing(&self) -> bool {
         self.p.allows_automatic_window_tabbing()
+    }
+
+    fn run_after_handler<F: FnOnce() + 'static>(&self, closure: F) {
+        self.p.run_after_handler(closure)
     }
 }
 

@@ -1,7 +1,8 @@
 use std::cell::{Cell, RefCell};
-use std::mem;
+use std::collections::VecDeque;
 use std::rc::Weak;
 use std::time::Instant;
+use std::{fmt, mem};
 
 use objc2::rc::Retained;
 use objc2::{declare_class, msg_send_id, mutability, ClassType, DeclaredClass};
@@ -40,6 +41,7 @@ pub(super) struct AppState {
     start_time: Cell<Option<Instant>>,
     wait_timeout: Cell<Option<Instant>>,
     pending_redraw: RefCell<Vec<WindowId>>,
+    after_handler: AfterHandler,
     // NOTE: This is strongly referenced by our `NSWindowDelegate` and our `NSView` subclass, and
     // as such should be careful to not add fields that, in turn, strongly reference those.
 }
@@ -98,6 +100,7 @@ impl ApplicationDelegate {
             start_time: Cell::new(None),
             wait_timeout: Cell::new(None),
             pending_redraw: RefCell::new(vec![]),
+            after_handler: AfterHandler::default(),
         });
         unsafe { msg_send_id![super(this), init] }
     }
@@ -321,7 +324,42 @@ impl ApplicationDelegate {
 
     #[track_caller]
     fn handle_event(&self, event: Event<HandlePendingUserEvents>) {
-        self.ivars().event_handler.handle_event(event, &ActiveEventLoop::new_root(self.retain()))
+        self.ivars().event_handler.handle_event(event, &ActiveEventLoop::new_root(self.retain()));
+        self.queue_after_handler();
+    }
+
+    /// Run `closure` on the main thread once no event handler is running.
+    ///
+    /// The closure also runs inside AppKit's event-tracking and modal-panel run loops. If a nested
+    /// run loop inside an event handler reaches it first, it waits until that handler returns.
+    pub fn run_after_handler(&self, closure: impl FnOnce() + 'static) {
+        self.ivars().after_handler.closures.borrow_mut().push_back(Box::new(closure));
+        self.queue_after_handler();
+    }
+
+    fn queue_after_handler(&self) {
+        let after_handler = &self.ivars().after_handler;
+        if after_handler.queued.get() || after_handler.closures.borrow().is_empty() {
+            return;
+        }
+        after_handler.queued.set(true);
+        let this = self.retain();
+        self.ivars().run_loop.queue_closure_in_common_modes(move || this.drain_after_handler());
+    }
+
+    fn drain_after_handler(&self) {
+        self.ivars().after_handler.queued.set(false);
+        if self.ivars().event_handler.in_use() {
+            // `handle_event` queues the closures again when the handler returns.
+            tracing::debug!(target: "winit::run_after_handler", "handler busy");
+            return;
+        }
+        loop {
+            let Some(closure) = self.ivars().after_handler.closures.borrow_mut().pop_front() else {
+                return;
+            };
+            closure();
+        }
     }
 
     /// dispatch `NewEvents(Init)` + `Resumed`
@@ -414,6 +452,22 @@ impl ApplicationDelegate {
 
 #[derive(Debug)]
 pub(crate) struct HandlePendingUserEvents;
+
+/// Closures waiting for the outermost event handler to return.
+#[derive(Default)]
+struct AfterHandler {
+    closures: RefCell<VecDeque<Box<dyn FnOnce()>>>,
+    queued: Cell<bool>,
+}
+
+impl fmt::Debug for AfterHandler {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AfterHandler")
+            .field("closures", &self.closures.borrow().len())
+            .field("queued", &self.queued)
+            .finish()
+    }
+}
 
 /// Returns the minimum `Option<Instant>`, taking into account that `None`
 /// equates to an infinite timeout, not a zero timeout (so can't just use

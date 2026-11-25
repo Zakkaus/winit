@@ -149,6 +149,10 @@ impl ActiveEventLoop {
         OwnedDisplayHandle
     }
 
+    pub(crate) fn run_after_handler(&self, closure: impl FnOnce() + 'static) {
+        self.delegate.run_after_handler(closure)
+    }
+
     pub(crate) fn hide_application(&self) {
         NSApplication::sharedApplication(self.mtm).hide(None)
     }
