@@ -87,7 +87,7 @@ use std::os::raw::c_void;
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
 
-use crate::event_loop::{ActiveEventLoop, EventLoopBuilder};
+use crate::event_loop::{ActiveEventLoop, EventLoopBuilder, EventLoopProxy};
 use crate::monitor::MonitorHandle;
 use crate::window::{Window, WindowAttributes};
 
@@ -497,6 +497,30 @@ pub trait ActiveEventLoopExtMacOS {
     /// The closure also runs while AppKit tracks a menu or a live resize and while it waits for
     /// `-[NSApplication replyToApplicationShouldTerminate:]`. Closures run in the order queued.
     fn run_after_handler<F: FnOnce() + 'static>(&self, closure: F);
+    /// Intercept native Quit (`-[NSApplication terminate:]`) so that the application can clean
+    /// up before it exits.
+    ///
+    /// The first Quit request sends `map(reason)` through `proxy` and is cancelled, as are the
+    /// requests that arrive before [`finish_quit`](Self::finish_quit). Without this hook, AppKit
+    /// exits as soon as Quit is chosen.
+    ///
+    /// # Panics
+    ///
+    /// Panics if Quit is already intercepted.
+    fn intercept_quit<T: 'static, F: Fn(QuitReason) -> T + 'static>(
+        &self,
+        proxy: EventLoopProxy<T>,
+        map: F,
+    );
+    /// Let the intercepted Quit proceed once cleanup is done.
+    ///
+    /// After the outermost event handler returns, winit re-issues `terminate:` and grants it.
+    /// The application exits through `applicationWillTerminate:`, so `run_app` does not return.
+    ///
+    /// # Panics
+    ///
+    /// Panics if no intercepted Quit request is pending.
+    fn finish_quit(&self);
 }
 
 impl ActiveEventLoopExtMacOS for ActiveEventLoop {
@@ -519,6 +543,27 @@ impl ActiveEventLoopExtMacOS for ActiveEventLoop {
     fn run_after_handler<F: FnOnce() + 'static>(&self, closure: F) {
         self.p.run_after_handler(closure)
     }
+
+    fn intercept_quit<T: 'static, F: Fn(QuitReason) -> T + 'static>(
+        &self,
+        proxy: EventLoopProxy<T>,
+        map: F,
+    ) {
+        self.p.intercept_quit(move |reason| {
+            let _ = proxy.send_event(map(reason));
+        })
+    }
+
+    fn finish_quit(&self) {
+        self.p.finish_quit()
+    }
+}
+
+/// Why AppKit asked the application to quit; see [`ActiveEventLoopExtMacOS::intercept_quit`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum QuitReason {
+    /// The Quit menu item, Cmd+Q, the Dock, or a quit Apple event from another application.
+    Ordinary,
 }
 
 /// Option as alt behavior.

@@ -7,7 +7,8 @@ use std::{fmt, mem};
 use objc2::rc::Retained;
 use objc2::{declare_class, msg_send_id, mutability, ClassType, DeclaredClass};
 use objc2_app_kit::{
-    NSApplication, NSApplicationActivationPolicy, NSApplicationDelegate, NSRunningApplication,
+    NSApplication, NSApplicationActivationPolicy, NSApplicationDelegate,
+    NSApplicationTerminateReply, NSRunningApplication,
 };
 use objc2_foundation::{MainThreadMarker, NSNotification, NSObject, NSObjectProtocol};
 
@@ -17,6 +18,7 @@ use super::observer::{EventLoopWaker, RunLoop};
 use super::{menu, WindowId, DEVICE_ID};
 use crate::event::{DeviceEvent, Event, StartCause, WindowEvent};
 use crate::event_loop::{ActiveEventLoop as RootActiveEventLoop, ControlFlow};
+use crate::platform::macos::QuitReason;
 use crate::window::WindowId as RootWindowId;
 
 #[derive(Debug)]
@@ -42,6 +44,7 @@ pub(super) struct AppState {
     wait_timeout: Cell<Option<Instant>>,
     pending_redraw: RefCell<Vec<WindowId>>,
     after_handler: AfterHandler,
+    quit: QuitHook,
     // NOTE: This is strongly referenced by our `NSWindowDelegate` and our `NSView` subclass, and
     // as such should be careful to not add fields that, in turn, strongly reference those.
 }
@@ -66,6 +69,11 @@ declare_class!(
         #[method(applicationDidFinishLaunching:)]
         fn app_did_finish_launching(&self, notification: &NSNotification) {
             self.did_finish_launching(notification)
+        }
+
+        #[method(applicationShouldTerminate:)]
+        fn app_should_terminate(&self, _sender: &NSApplication) -> NSApplicationTerminateReply {
+            self.should_terminate()
         }
 
         #[method(applicationWillTerminate:)]
@@ -101,6 +109,7 @@ impl ApplicationDelegate {
             wait_timeout: Cell::new(None),
             pending_redraw: RefCell::new(vec![]),
             after_handler: AfterHandler::default(),
+            quit: QuitHook::default(),
         });
         unsafe { msg_send_id![super(this), init] }
     }
@@ -164,6 +173,64 @@ impl ApplicationDelegate {
             let app = NSApplication::sharedApplication(mtm);
             stop_app_immediately(&app);
         }
+    }
+
+    pub fn intercept_quit(&self, request: impl Fn(QuitReason) + 'static) {
+        let quit = &self.ivars().quit;
+        assert_eq!(quit.state.get(), QuitState::Disabled, "Quit is already intercepted");
+        *quit.request.borrow_mut() = Some(Box::new(request));
+        quit.state.set(QuitState::Armed);
+    }
+
+    pub fn finish_quit(&self) {
+        let quit = &self.ivars().quit;
+        let QuitState::Draining(reason) = quit.state.get() else {
+            panic!("finish_quit without a pending Quit request");
+        };
+        quit.state.set(QuitState::Finishing(reason));
+        let this = self.retain();
+        self.run_after_handler(move || this.complete_quit());
+    }
+
+    fn complete_quit(&self) {
+        let app = NSApplication::sharedApplication(MainThreadMarker::from(self));
+        let quit = &self.ivars().quit;
+        match quit.state.get() {
+            QuitState::Finishing(QuitReason::Ordinary) => {
+                quit.state.set(QuitState::Authorized);
+                // SAFETY: On the main thread and outside any event handler, so the granted
+                // request's `applicationWillTerminate:` can run winit's handler.
+                unsafe { app.terminate(None) };
+            },
+            state => unreachable!("Quit completed in state {state:?}"),
+        }
+    }
+
+    /// Forward the first request to the application and cancel it; cancel repeats while the
+    /// application drains, and grant only the request that `complete_quit` re-issues.
+    fn should_terminate(&self) -> NSApplicationTerminateReply {
+        let quit = &self.ivars().quit;
+        let reason = QuitReason::Ordinary;
+        let (state, phase, reply) = match quit.state.get() {
+            QuitState::Disabled => return NSApplicationTerminateReply::NSTerminateNow,
+            QuitState::Armed => {
+                (quit.request.borrow().as_ref().expect("armed Quit hook"))(reason);
+                (
+                    QuitState::Draining(reason),
+                    "intercept",
+                    NSApplicationTerminateReply::NSTerminateCancel,
+                )
+            },
+            state @ (QuitState::Draining(_) | QuitState::Finishing(_)) => {
+                (state, "veto", NSApplicationTerminateReply::NSTerminateCancel)
+            },
+            QuitState::Authorized => {
+                (QuitState::Authorized, "grant", NSApplicationTerminateReply::NSTerminateNow)
+            },
+        };
+        tracing::debug!(target: "winit::quit", "{phase}");
+        quit.state.set(state);
+        reply
     }
 
     fn will_terminate(&self, _notification: &NSNotification) {
@@ -466,6 +533,38 @@ impl fmt::Debug for AfterHandler {
             .field("closures", &self.closures.borrow().len())
             .field("queued", &self.queued)
             .finish()
+    }
+}
+
+/// How the application delegate answers `applicationShouldTerminate:`.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+enum QuitState {
+    /// No Quit hook: terminate at once, as upstream winit does.
+    #[default]
+    Disabled,
+    /// The next request is sent to the application.
+    Armed,
+    /// The application drains after a request for this reason.
+    Draining(QuitReason),
+    /// `finish_quit` queued the completion for this reason.
+    Finishing(QuitReason),
+    /// The request re-issued by `complete_quit` is granted.
+    Authorized,
+}
+
+/// Sends a Quit request to the application.
+type QuitRequest = Box<dyn Fn(QuitReason)>;
+
+/// The Quit hook installed by `intercept_quit`.
+#[derive(Default)]
+struct QuitHook {
+    state: Cell<QuitState>,
+    request: RefCell<Option<QuitRequest>>,
+}
+
+impl fmt::Debug for QuitHook {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("QuitHook").field("state", &self.state).finish_non_exhaustive()
     }
 }
 

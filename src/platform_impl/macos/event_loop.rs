@@ -30,7 +30,7 @@ use crate::event::Event;
 use crate::event_loop::{
     ActiveEventLoop as RootWindowTarget, ControlFlow, DeviceEvents, EventLoopClosed,
 };
-use crate::platform::macos::ActivationPolicy;
+use crate::platform::macos::{ActivationPolicy, QuitReason};
 use crate::platform::pump_events::PumpStatus;
 use crate::platform_impl::platform::cursor::CustomCursor;
 use crate::window::{CustomCursor as RootCustomCursor, CustomCursorSource, Theme};
@@ -151,6 +151,14 @@ impl ActiveEventLoop {
 
     pub(crate) fn run_after_handler(&self, closure: impl FnOnce() + 'static) {
         self.delegate.run_after_handler(closure)
+    }
+
+    pub(crate) fn intercept_quit(&self, request: impl Fn(QuitReason) + 'static) {
+        self.delegate.intercept_quit(request)
+    }
+
+    pub(crate) fn finish_quit(&self) {
+        self.delegate.finish_quit()
     }
 
     pub(crate) fn hide_application(&self) {
