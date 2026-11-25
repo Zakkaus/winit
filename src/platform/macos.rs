@@ -566,9 +566,9 @@ impl ActiveEventLoopExtMacOS for ActiveEventLoop {
 /// Why AppKit asked the application to quit; see [`ActiveEventLoopExtMacOS::intercept_quit`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum QuitReason {
-    /// The Quit menu item, Cmd+Q, the Dock, or a quit Apple event without a system reason.
+    /// The Quit menu item, Cmd+Q, the Dock, or a quit Apple event without a reason.
     Ordinary,
-    /// A quit Apple event whose `keyAEQuitReason` is log out, restart or shut down.
+    /// A quit Apple event with any `keyAEQuitReason`, such as log out, restart or shut down.
     System,
 }
 

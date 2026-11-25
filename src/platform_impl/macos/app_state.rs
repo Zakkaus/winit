@@ -552,19 +552,14 @@ impl fmt::Debug for AfterHandler {
     }
 }
 
-/// Read `keyAEQuitReason` (`'why?'`) from the quit Apple event being handled, if any.
+/// Classify the quit Apple event being handled, if any, by whether it carries a
+/// `keyAEQuitReason` (`'why?'`). loginwindow sets one for log out, restart and shut down; the
+/// Dock, AppleScript and the Quit menu item send none. Any reason, known or not, is
+/// [`QuitReason::System`], so a request from the system is never refused.
 fn quit_reason() -> QuitReason {
     const fn code(bytes: &[u8; 4]) -> u32 {
         u32::from_be_bytes(*bytes)
     }
-    const SYSTEM: [u32; 6] = [
-        code(b"logo"), // kAELogOut
-        code(b"rlgo"), // kAEReallyLogOut
-        code(b"rrst"), // kAEShowRestartDialog
-        code(b"rest"), // kAERestart
-        code(b"rsdn"), // kAEShowShutdownDialog
-        code(b"shut"), // kAEShutDown
-    ];
 
     // SAFETY: Called on the main thread; the selectors exist on `NSAppleEventManager` and
     // `NSAppleEventDescriptor` with these argument and return types.
@@ -581,11 +576,7 @@ fn quit_reason() -> QuitReason {
         let why: Option<Retained<NSAppleEventDescriptor>> =
             msg_send_id![&event, attributeDescriptorForKeyword: code(b"why?")];
         let why = why.or_else(|| msg_send_id![&event, paramDescriptorForKeyword: code(b"why?")]);
-        let why = why.map(|why| match why.typeCodeValue() {
-            0 => why.enumCodeValue(),
-            why => why,
-        });
-        if why.is_some_and(|why| SYSTEM.contains(&why)) {
+        if why.is_some() {
             QuitReason::System
         } else {
             QuitReason::Ordinary
