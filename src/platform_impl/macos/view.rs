@@ -893,6 +893,13 @@ impl WinitView {
             self.ivars().ime_state.set(ImeState::Disabled);
             self.queue_event(WindowEvent::Ime(Ime::Disabled));
         }
+
+        // End the input method's own composition too, or its candidate window stays open and
+        // the next key continues the old text. Our state is already clear, so a commit the
+        // input method sends while discarding finds no marked text and is dropped.
+        if let Some(input_context) = self.inputContext() {
+            input_context.discardMarkedText();
+        }
     }
 
     pub(super) fn set_ime_cursor_area(&self, position: NSPoint, size: NSSize) {
