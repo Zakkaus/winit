@@ -185,24 +185,9 @@ declare_class!(
         #[method(inputSourceDidChange:)]
         fn input_source_did_change(&self, _notification: &NSNotification) {
             trace_scope!("inputSourceDidChange:");
-            // The old input method's composition ended with it. Leave it now, as `keyDown:`
-            // would at the next key, so its marked text does not wait for one, and end it in
-            // AppKit too, as disallowing input methods does, or its text can stay marked there.
-            // Our state is clear first, so a commit the old input method sends on deactivation
-            // or while discarding finds no marked text and is dropped.
-            let current_input_source = self.current_input_source();
-            let mut prev_input_source = self.ivars().input_source.borrow_mut();
-            if *prev_input_source == current_input_source || !self.is_ime_enabled() {
-                return;
-            }
-            *prev_input_source = current_input_source;
-            drop(prev_input_source);
-            *self.ivars().marked_text.borrow_mut() = NSMutableAttributedString::new();
-            self.ivars().ime_state.set(ImeState::Disabled);
-            self.queue_event(WindowEvent::Ime(Ime::Disabled));
-            if let Some(input_context) = self.inputContext() {
-                input_context.discardMarkedText();
-            }
+            // Leave the old input method's composition now, so its marked text does not wait
+            // for the next key.
+            self.leave_changed_input_source();
         }
 
         #[method(frameDidChange:)]
@@ -469,16 +454,8 @@ declare_class!(
         #[method(keyDown:)]
         fn key_down(&self, event: &NSEvent) {
             trace_scope!("keyDown:");
-            {
-                let mut prev_input_source = self.ivars().input_source.borrow_mut();
-                let current_input_source = self.current_input_source();
-                if *prev_input_source != current_input_source && self.is_ime_enabled() {
-                    *prev_input_source = current_input_source;
-                    drop(prev_input_source);
-                    self.ivars().ime_state.set(ImeState::Disabled);
-                    self.queue_event(WindowEvent::Ime(Ime::Disabled));
-                }
-            }
+            // The key can reach us before the input-source notification does.
+            self.leave_changed_input_source();
 
             // Get the characters from the event.
             let old_ime_state = self.ivars().ime_state.get();
@@ -902,6 +879,29 @@ impl WinitView {
 
     fn is_ime_enabled(&self) -> bool {
         !matches!(self.ivars().ime_state.get(), ImeState::Disabled)
+    }
+
+    /// End the composition of an input method that is no longer the selected input source.
+    ///
+    /// `keyDown:` and the input-source notification both call this, whichever comes first;
+    /// the other finds the source already recorded and does nothing, so `Disabled` is sent once.
+    /// The composition is ended in AppKit too, as disallowing input methods does, or its text
+    /// can stay marked there. Our state is clear first, so a commit the old input method sends
+    /// on deactivation or while discarding finds no marked text and is dropped.
+    fn leave_changed_input_source(&self) {
+        let current_input_source = self.current_input_source();
+        let mut prev_input_source = self.ivars().input_source.borrow_mut();
+        if *prev_input_source == current_input_source || !self.is_ime_enabled() {
+            return;
+        }
+        *prev_input_source = current_input_source;
+        drop(prev_input_source);
+        *self.ivars().marked_text.borrow_mut() = NSMutableAttributedString::new();
+        self.ivars().ime_state.set(ImeState::Disabled);
+        self.queue_event(WindowEvent::Ime(Ime::Disabled));
+        if let Some(input_context) = self.inputContext() {
+            input_context.discardMarkedText();
+        }
     }
 
     fn current_input_source(&self) -> String {
