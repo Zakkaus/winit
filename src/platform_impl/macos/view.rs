@@ -8,12 +8,13 @@ use objc2::runtime::{AnyObject, Sel};
 use objc2::{declare_class, msg_send_id, mutability, sel, ClassType, DeclaredClass};
 use objc2_app_kit::{
     NSApplication, NSCursor, NSEvent, NSEventModifierFlags, NSEventPhase, NSResponder,
-    NSTextInputClient, NSTrackingRectTag, NSView, NSViewFrameDidChangeNotification,
+    NSTextInputClient, NSTextInputContextKeyboardSelectionDidChangeNotification, NSTrackingRectTag,
+    NSView, NSViewFrameDidChangeNotification,
 };
 use objc2_foundation::{
     MainThreadMarker, NSArray, NSAttributedString, NSAttributedStringKey, NSCopying,
-    NSMutableAttributedString, NSNotFound, NSNotificationCenter, NSObject, NSObjectProtocol,
-    NSPoint, NSRange, NSRect, NSSize, NSString, NSUInteger,
+    NSMutableAttributedString, NSNotFound, NSNotification, NSNotificationCenter, NSObject,
+    NSObjectProtocol, NSPoint, NSRange, NSRect, NSSize, NSString, NSUInteger,
 };
 
 use super::app_state::ApplicationDelegate;
@@ -131,6 +132,10 @@ pub struct ViewState {
     /// to the application, even during IME
     forward_key_to_app: Cell<bool>,
 
+    /// Key codes of Command chords whose press skipped the input method: their key-up is
+    /// forwarded too, even if Command was released first.
+    command_keys: RefCell<Vec<u16>>,
+
     marked_text: RefCell<Retained<NSMutableAttributedString>>,
     accepts_first_mouse: bool,
 
@@ -175,6 +180,24 @@ declare_class!(
             };
             assert_ne!(tracking_rect, 0, "failed adding tracking rect");
             self.ivars().tracking_rect.set(Some(tracking_rect));
+        }
+
+        #[method(inputSourceDidChange:)]
+        fn input_source_did_change(&self, _notification: &NSNotification) {
+            trace_scope!("inputSourceDidChange:");
+            // The old input method's composition ended with it. Leave it now, as `keyDown:`
+            // would at the next key, so its marked text does not wait for one; a commit the
+            // old input method sends on deactivation finds no marked text and is dropped.
+            let current_input_source = self.current_input_source();
+            let mut prev_input_source = self.ivars().input_source.borrow_mut();
+            if *prev_input_source == current_input_source || !self.is_ime_enabled() {
+                return;
+            }
+            *prev_input_source = current_input_source;
+            drop(prev_input_source);
+            *self.ivars().marked_text.borrow_mut() = NSMutableAttributedString::new();
+            self.ivars().ime_state.set(ImeState::Disabled);
+            self.queue_event(WindowEvent::Ime(Ime::Disabled));
         }
 
         #[method(frameDidChange:)]
@@ -491,6 +514,14 @@ declare_class!(
                 _ => old_ime_state != self.ivars().ime_state.get(),
             };
 
+            if command {
+                let code = unsafe { event.keyCode() };
+                let mut command_keys = self.ivars().command_keys.borrow_mut();
+                if !command_keys.contains(&code) {
+                    command_keys.push(code);
+                }
+            }
+
             if command || !had_ime_input || self.ivars().forward_key_to_app.get() {
                 let key_event = create_key_event(&event, true, unsafe { event.isARepeat() });
                 self.queue_event(WindowEvent::KeyboardInput {
@@ -509,8 +540,15 @@ declare_class!(
             self.update_modifiers(&event, false);
 
             // We want to send keyboard input when we are currently in the ground state, and
-            // the release of a Command chord, whose press bypassed the input method.
-            if is_command(&event)
+            // the release of a Command chord whose press bypassed the input method, whether or
+            // not Command is still held.
+            let code = unsafe { event.keyCode() };
+            let paired = {
+                let mut command_keys = self.ivars().command_keys.borrow_mut();
+                let index = command_keys.iter().position(|&key| key == code);
+                index.map(|index| command_keys.swap_remove(index)).is_some()
+            };
+            if paired
                 || matches!(
                     self.ivars().ime_state.get(),
                     ImeState::Ground | ImeState::Disabled
@@ -810,6 +848,7 @@ impl WinitView {
             input_source: Default::default(),
             ime_allowed: Default::default(),
             forward_key_to_app: Default::default(),
+            command_keys: Default::default(),
             marked_text: Default::default(),
             accepts_first_mouse,
             _ns_window: WeakId::new(&window.retain()),
@@ -825,7 +864,13 @@ impl WinitView {
                 sel!(frameDidChange:),
                 Some(NSViewFrameDidChangeNotification),
                 Some(&this),
-            )
+            );
+            notification_center.addObserver_selector_name_object(
+                &this,
+                sel!(inputSourceDidChange:),
+                Some(NSTextInputContextKeyboardSelectionDidChangeNotification),
+                None,
+            );
         }
 
         *this.ivars().input_source.borrow_mut() = this.current_input_source();
