@@ -7,8 +7,8 @@ use objc2::rc::{Retained, WeakId};
 use objc2::runtime::{AnyObject, Sel};
 use objc2::{declare_class, msg_send_id, mutability, sel, ClassType, DeclaredClass};
 use objc2_app_kit::{
-    NSApplication, NSCursor, NSEvent, NSEventPhase, NSResponder, NSTextInputClient,
-    NSTrackingRectTag, NSView, NSViewFrameDidChangeNotification,
+    NSApplication, NSCursor, NSEvent, NSEventModifierFlags, NSEventPhase, NSResponder,
+    NSTextInputClient, NSTrackingRectTag, NSView, NSViewFrameDidChangeNotification,
 };
 use objc2_foundation::{
     MainThreadMarker, NSArray, NSAttributedString, NSAttributedStringKey, NSCopying,
@@ -463,7 +463,11 @@ declare_class!(
             // we must send the `KeyboardInput` event during IME if it triggered
             // `doCommandBySelector`. (doCommandBySelector means that the keyboard input
             // is not handled by IME and should be handled by the application)
-            if self.ivars().ime_allowed.get() {
+            //
+            // A Command chord is the application's shortcut, not text: the input method would
+            // take Cmd+V as `v` and continue its composition with it.
+            let command = is_command(&event);
+            if self.ivars().ime_allowed.get() && !command {
                 let events_for_nsview = NSArray::from_slice(&[&*event]);
                 unsafe { self.interpretKeyEvents(&events_for_nsview) };
 
@@ -487,7 +491,7 @@ declare_class!(
                 _ => old_ime_state != self.ivars().ime_state.get(),
             };
 
-            if !had_ime_input || self.ivars().forward_key_to_app.get() {
+            if command || !had_ime_input || self.ivars().forward_key_to_app.get() {
                 let key_event = create_key_event(&event, true, unsafe { event.isARepeat() });
                 self.queue_event(WindowEvent::KeyboardInput {
                     device_id: DEVICE_ID,
@@ -504,11 +508,14 @@ declare_class!(
             let event = replace_event(event, self.option_as_alt());
             self.update_modifiers(&event, false);
 
-            // We want to send keyboard input when we are currently in the ground state.
-            if matches!(
-                self.ivars().ime_state.get(),
-                ImeState::Ground | ImeState::Disabled
-            ) {
+            // We want to send keyboard input when we are currently in the ground state, and
+            // the release of a Command chord, whose press bypassed the input method.
+            if is_command(&event)
+                || matches!(
+                    self.ivars().ime_state.get(),
+                    ImeState::Ground | ImeState::Disabled
+                )
+            {
                 self.queue_event(WindowEvent::KeyboardInput {
                     device_id: DEVICE_ID,
                     event: create_key_event(&event, false, false),
@@ -1146,4 +1153,8 @@ fn replace_event(event: &NSEvent, option_as_alt: OptionAsAlt) -> Retained<NSEven
     } else {
         event.copy()
     }
+}
+
+fn is_command(event: &NSEvent) -> bool {
+    unsafe { event.modifierFlags() }.contains(NSEventModifierFlags::NSEventModifierFlagCommand)
 }
